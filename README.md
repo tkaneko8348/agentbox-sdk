@@ -1,0 +1,455 @@
+# AgentBox
+
+[Live demo](https://agentbox-demo-175164121374.us-west1.run.app/)
+
+Run coding agents inside sandboxes. One API, any provider.
+
+Unlike wrappers that shell out to CLIs in non-interactive mode (e.g. `claude --print`), AgentBox launches each agent as a **server process** inside the sandbox and communicates over WebSocket or HTTP. This preserves the full interactive capabilities of each agent — approval flows, tool-use control, streaming events.
+
+```ts
+import { Agent, Sandbox } from "agentbox-sdk";
+
+const sandbox = new Sandbox("local-docker", {
+  workingDir: "/workspace",
+  image: process.env.IMAGE_ID!,
+  env: { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY! },
+});
+
+await sandbox.findOrProvision();
+
+const run = new Agent("claude-code", {
+  sandbox,
+  cwd: "/workspace",
+  approvalMode: "auto",
+}).stream({
+  model: "sonnet",
+  input: "Create a hello world Express server in /workspace/server.ts",
+});
+
+for await (const event of run) {
+  if (event.type === "text.delta") process.stdout.write(event.delta);
+}
+
+await sandbox.delete();
+```
+
+Providers are mix-and-match:
+
+- **Agents** — [`claude-code`](./src/agents/providers/claude-code.ts), [`opencode`](./src/agents/providers/opencode.ts), [`codex`](./src/agents/providers/codex.ts)
+- **Sandboxes** — [`local-docker`](./src/sandboxes/providers/local-docker.ts), [`e2b`](./src/sandboxes/providers/e2b.ts), [`modal`](./src/sandboxes/providers/modal.ts), [`daytona`](./src/sandboxes/providers/daytona.ts), [`vercel`](./src/sandboxes/providers/vercel.ts)
+
+Swap either one and your app code stays the same.
+
+## Install
+
+```bash
+npm install agentbox-sdk
+```
+
+Requires Node >= 20. The agent CLI you want to use (`claude`, `opencode`, `codex`) should be installed inside your sandbox image.
+
+## Getting started
+
+### 1. Build a sandbox image
+
+AgentBox ships with built-in image presets. Build one for your sandbox provider:
+
+```bash
+npx agentbox image build --provider local-docker --preset browser-agent
+```
+
+This prints an image reference (a Docker tag, Modal image ID, E2B template, or Daytona snapshot depending on the provider). Set it as `IMAGE_ID`:
+
+```bash
+export IMAGE_ID=<printed value>
+```
+
+### 2. Run an agent
+
+```ts
+import { Agent, Sandbox } from "agentbox-sdk";
+
+const sandbox = new Sandbox("local-docker", {
+  workingDir: "/workspace",
+  image: process.env.IMAGE_ID!,
+  env: { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY! },
+});
+
+// Explicitly attach to / create the sandbox before running anything.
+// Subsequent `sandbox.run`, `sandbox.gitClone`, agent runs, etc. all
+// require this to have happened first.
+await sandbox.findOrProvision();
+
+const agent = new Agent("claude-code", {
+  sandbox,
+  cwd: "/workspace",
+  approvalMode: "auto",
+});
+
+const result = await agent.run({
+  model: "sonnet",
+  input:
+    "Explain the project structure and write a summary to /workspace/OVERVIEW.md",
+});
+
+console.log(result.text);
+await sandbox.delete();
+```
+
+### 3. Stream events
+
+`agent.stream()` returns an async iterable of normalized events:
+
+```ts
+const run = agent.stream({
+  model: "sonnet",
+  input: "Write a fizzbuzz in Python",
+});
+
+for await (const event of run) {
+  if (event.type === "text.delta") {
+    process.stdout.write(event.delta);
+  }
+}
+
+const result = await run.finished;
+```
+
+Claude Code can leave work running after its turn ends (`run_in_background`
+shells, `Monitor`, background subagents, scheduled wakeups) and re-prompts
+itself when that work finishes. AgentBox reports it through `background.tasks`
+events — `tasks` is the full live set after each change and `waiting` is `true`
+while the harness has ended its turn and the run stays open only for those
+tasks (or, with an empty set, for the wake-up the CLI queues for a task that
+finished mid-turn) — and settles the run on the follow-up turn's result
+instead of the first one. Once background work has been seen, a turn end
+settles the run when Claude emits `session_state_changed: idle` and the live
+task set is empty. AgentBox enables this documented CLI event with
+`CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1`; there is no extra model call or
+fixed completion delay ([upstream opt-in documentation](https://github.com/anthropics/claude-agent-sdk-typescript/blob/main/CHANGELOG.md#0283)). Older/custom CLIs that never emit session state use
+a 15s grace as a compatibility fallback. A final
+`background.tasks` with `tasks: []` and `waiting: false` precedes the settle.
+`backgroundTaskTimeoutMs` bounds the total time spent waiting across the run:
+default 30 minutes, `0` settles at the first turn end as before, `Infinity`
+waits forever. On expiry the tasks are stopped best-effort and the run
+completes with the last turn's text.
+
+### Event retention
+
+`AgentResult.events` and `AgentResult.rawEvents` replay everything a run
+emitted, which means a run holds its whole transcript — every tool result,
+every file the agent read — in memory until it settles. A host that consumes
+the live stream (`for await (const event of run)` / `run.rawEvents()`) never
+reads those arrays, so it can turn retention off:
+
+```ts
+const agent = new Agent("claude-code", { sandbox, retainEvents: false });
+```
+
+Both arrays then settle as `[]`. Streamed events, `text` and `costData` are
+unaffected — cost is accumulated as payloads arrive rather than recomputed
+from a retained transcript.
+
+### Harness commands
+
+A run whose input starts with `/name args` carries the harness's own slash
+command. `resolveHarnessCommand(provider, input)` keeps the text as typed and
+returns `command: { name, args }` for `AgentRunConfig.command`; `/plan`,
+`/agent`, and `/goal` stay harness modes as before. Each adapter dispatches
+what its CLI supports headlessly:
+
+- Claude Code parses slash commands from the user message itself (`/compact`,
+  `/context`, `/init`, skills, custom commands, plugin commands).
+- Codex maps `/compact` to `thread/compact/start`, `/review [instructions]` to
+  `review/start`, `/init` to the TUI's AGENTS.md prompt, and an installed skill
+  to its `$name` mention.
+- OpenCode maps `/compact` to `POST /session/:id/summarize`, a configured
+  command to `POST /session/:id/command`, and an installed skill to a
+  directive the model follows. Configured command calls preserve file and
+  image attachments. They reject a per-run `systemPrompt` because OpenCode's
+  command endpoint cannot accept it; use a normal prompt or the setup-time
+  `OpenCodeAgentOptions.systemPrompt` instead. This also applies to the runtime
+  system appendix generated from configured MCPs, skills, sub-agents, or commands.
+
+Anything the harness does not know is sent as plain text. Each run emits one
+`harness.commands` event listing what it can run (`HarnessCommandDescriptor[]`:
+name, description, argument hint, source), so a host can build its `/` menu;
+`builtinHarnessCommands(provider)` gives the static list before a run exists.
+Tasks marked ambient by Claude (such as live-update watchers) do not keep the
+run waiting. The SDK's full task snapshots take precedence over task start and
+finish events, whose ordering relative to those snapshots is unspecified.
+
+AgentBox does not inject a Stop-hook prompt or infer from the answer that a
+running task is unwanted. A genuinely live polling helper keeps the run open
+until it finishes, is stopped, or reaches the wait budget. Unlike the interactive
+CLI, an AgentBox run owns the query lifetime: completing it closes the process.
+Keep the streaming input open while waiting so background continuations retain
+their hooks, permissions, and SDK MCP control channel.
+
+The host decides when a wait has stopped being useful. A foreground command
+that outlives Bash's timeout is moved to the background by the CLI, and a model
+that answers without it leaves the run open for work nobody needs.
+`run.finishBackgroundWait()` ends the wait: a run that is only waiting stops
+what is left and completes with the answer it already has (`run.completed`,
+not `run.cancelled` as with `abort()`). The request latches, so calling it
+while a turn is active applies at that turn's end; a run that never waits
+ignores it. Use it when the user moves on, for example by sending a follow-up.
+It applies equally to Codex native goal waits and OpenCode background subagents.
+
+```ts
+for await (const event of run) {
+  if (event.type === "background.tasks" && event.waiting && userMovedOn()) {
+    await run.finishBackgroundWait();
+  }
+}
+```
+
+**Parked runs (claude-code in a sandbox).** A sandbox outlives the run, and so
+does the in-sandbox daemon, so a run there does not have to stay open at all.
+With `provider.parkBackgroundWork: { wakeUrl, wakeToken }` a run whose turn
+ends with background work still live **completes at its answer** and the daemon
+keeps the CLI for that work; the last `background.tasks` event carries
+`parked: true` and the tasks still running. A turn that ends with nothing live
+is untouched: the CLI winds down as before. While parked:
+
+- The next run that resumes the session takes the same CLI over (never a second
+  one on the session). It learns what was live, skips the results of turns that
+  ran before its own input, answers, and parks again if work is still live.
+- When the CLI starts a turn on its own with nobody attached, the daemon POSTs
+  `{ runId, sessionId }` to `wakeUrl` with `Authorization: Bearer <wakeToken>`,
+  retrying until it gets a 2xx. Stream that turn with
+  `agent.stream({ input: "", resumeSessionId, resumeParked: true })`; it
+  completes with empty text if nothing is parked. Whether to act on a wake is
+  the host's call: a host already running that session is attached to the same
+  CLI, which delivers the turn inside that run.
+- The park lasts what is left of `backgroundTaskTimeoutMs`, then the CLI winds
+  down as at the wait ceiling. A rewind (`forkSessionId`) and an explicit
+  `DELETE` end it too. With parking on, `finishBackgroundWait()` parks rather
+  than stops the work. Output is buffered while nobody is attached (partial
+  deltas excepted), up to 16 MB.
+
+Codex owns command polling (`write_stdin`), yielded code-mode waits (`wait`),
+and subagent waits (`wait_agent`). AgentBox finishes an ordinary Codex run on
+its root `turn/completed`, regardless of shell processes still running. It does
+not classify commands, wait for their exit, or inject synthetic follow-up turns.
+Raw tool events remain available. A command ending after the final turn does
+not restart the model. Remote cleanup disconnects from the shared app-server;
+local cleanup shuts down the app-server it owns.
+
+Native Codex goals are a separate lifecycle: an active root-thread goal keeps
+the run open between turns so Codex can continue on its own. AgentBox reports
+these gaps with `background.tasks { tasks: [], waiting: true }` and clears the
+wait when the next native turn starts. A root goal becoming `complete` or
+`blocked` ends the run after its final turn; a goal cleared or made inactive
+while idle settles immediately. Child-thread and stale-turn goal updates do
+not end the root run. `blocked` preserves the final answer without implying
+that the objective was achieved.
+
+Only these native goal waits use `backgroundTaskTimeoutMs` for Codex. The
+15-second idle grace and total wait ceiling bound the gap between native turns;
+`0` settles at the first turn. Expiry settles with the last answer without
+terminating remote shell processes. A user message can resume an idle goal
+wait. Stateless cancellation (`Agent.attach(...).abort()`) interrupts an active
+turn, or starts a turn only to interrupt it if the thread is idle, then stops
+the idle thread's leftover terminals. Claude Code and OpenCode retain their own
+background-work handling described above and below.
+
+OpenCode has no background shells, monitors, or wake-ups; its only work that
+outlives a turn is `task {background: true}`, which the server accepts only when
+it runs with `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true` (or the
+`OPENCODE_EXPERIMENTAL` umbrella) in its environment. With that flag the parent
+session goes idle while the child session runs and OpenCode itself re-prompts
+the parent with the child's result. AgentBox recognises a background child from
+the parent's `task` tool call (`metadata.background`), so nothing depends on the
+caller's env: while such a child is live at the parent's idle the run stays
+open, the children are reported through `background.tasks` (`type:
+"subagent"`, `description` is the task description / child session title),
+`waiting` flips to `false` when the parent resumes, and the run settles on the
+next parent idle with nothing live — its text is the parent's last assistant
+message, never the injected result. Child liveness comes from SSE frames
+reconciled against `GET /session/status` at each parent idle and while waiting,
+and the injected `<task id=… state=…>` result also counts as the child's
+completion, so a lost frame cannot hold the run open. A child that ends without
+waking the parent settles the run after the 15s grace. `backgroundTaskTimeoutMs`
+bounds the total wait as for Claude Code; on expiry, or when the run fails with
+a child still live, the leftover subagents are stopped best-effort via
+`POST /session/:id/abort`. Aborting the run while waiting cancels the children
+through the same endpoint. Without the flag nothing changes: a parent idle is
+the end of the run.
+
+## Agents
+
+Four agent providers are supported. Each wraps a CLI that runs inside the sandbox:
+
+| Provider      | CLI        | Model format                                    |
+| ------------- | ---------- | ----------------------------------------------- |
+| `claude-code` | `claude`   | `sonnet`, `opus`, `haiku`                       |
+| `opencode`    | `opencode` | `anthropic/claude-sonnet-4-6`, `openai/gpt-4.1` |
+| `codex`       | `codex`    | `gpt-5.3-codex`, `gpt-5.4`                      |
+
+```ts
+new Agent("claude-code", { sandbox, cwd: "/workspace", approvalMode: "auto" });
+new Agent("open-code", { sandbox, cwd: "/workspace", approvalMode: "auto" });
+new Agent("codex", { sandbox, cwd: "/workspace", approvalMode: "auto" });
+```
+
+### Reasoning effort
+
+Pass an optional `reasoning` level alongside `model` on any run. It maps to each provider's native reasoning control: Codex's `effort` on `turn/start`, Claude Code's `--effort` flag, and OpenCode's `reasoningEffort` agent variant.
+
+```ts
+await agent.run({
+  model: "sonnet",
+  reasoning: "high", // "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+  input: "Refactor this module and explain your reasoning.",
+});
+```
+
+`xhigh` requires a model that supports it (e.g. Claude Opus 4.7+, Codex `gpt-5.4`).
+
+Codex also supports `max` (maximum reasoning) and `ultra` (maximum reasoning with automatic task delegation). Astra, GPT-5.6 Sol, and GPT-5.6 Terra support both; GPT-5.6 Luna supports `max`. Check the runtime's `model/list` → `supportedReasoningEfforts` for model availability. Both values are forwarded unchanged to `turn/start.effort`, including resumed and plan-mode turns; other AgentBox providers reject them.
+
+### Open-source & custom models (OpenRouter, OSS)
+
+Codex isn't limited to OpenAI models — it can route through any
+OpenAI-compatible endpoint (OpenRouter, a local Ollama/LM Studio/vLLM
+server, a proxy). Just like the opencode provider lights up OpenRouter
+from `OPENROUTER_API_KEY`, the codex provider does too: set the key in the
+agent env and pass an OpenRouter model slug.
+
+```ts
+const agent = new Agent("codex", {
+  sandbox,
+  cwd: "/workspace",
+  approvalMode: "auto",
+  env: { OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY! },
+});
+
+await agent.run({
+  model: "openai/gpt-5.3-codex", // any OpenRouter model slug
+  input: "Explain the project structure.",
+});
+```
+
+When `OPENROUTER_API_KEY` is present (and `OPENAI_API_KEY` is not), AgentBox
+auto-registers an `openrouter` model provider pointing at
+`https://openrouter.ai/api/v1` and selects it. Override the endpoint with
+`OPENROUTER_BASE_URL`.
+
+For any other OpenAI-compatible endpoint, declare providers explicitly via
+`provider.modelProviders` and pick one with `provider.modelProvider`:
+
+```ts
+new Agent("codex", {
+  sandbox,
+  cwd: "/workspace",
+  env: { TOGETHER_API_KEY: process.env.TOGETHER_API_KEY! },
+  provider: {
+    modelProvider: "together",
+    modelProviders: {
+      together: {
+        name: "Together",
+        baseUrl: "https://api.together.xyz/v1",
+        envKey: "TOGETHER_API_KEY",
+        wireApi: "responses", // codex removed the "chat" wire API
+      },
+    },
+  },
+});
+```
+
+These are written into Codex's `config.toml` as `[model_providers.*]`
+blocks, which the codex app-server reads via `CODEX_HOME`. The model slug
+stays a per-run value; the provider is agent-level config. Note that codex
+dropped the Chat Completions wire API in early 2026 — providers must speak
+the Responses API (`wire_api = "responses"`), which OpenRouter and LM
+Studio support; chat-only backends need a responses→chat proxy.
+
+## Sandboxes
+
+Five sandbox providers are supported. Each gives you an isolated environment with the same interface:
+
+| Provider       | What it is             | Auth                                                    |
+| -------------- | ---------------------- | ------------------------------------------------------- |
+| `local-docker` | Local Docker container | Docker daemon                                           |
+| `e2b`          | Cloud micro-VM         | `E2B_API_KEY`                                           |
+| `modal`        | Cloud container        | `MODAL_TOKEN_ID` + `MODAL_TOKEN_SECRET`                 |
+| `daytona`      | Cloud dev environment  | `DAYTONA_API_KEY`                                       |
+| `vercel`       | Ephemeral cloud VM     | `VERCEL_TOKEN` + `VERCEL_TEAM_ID` + `VERCEL_PROJECT_ID` |
+
+Every sandbox supports: `findOrProvision()`, `run()`, `runAsync()`, `gitClone()`, `uploadAndRun()`, `openPort()`, `getPreviewLink()`, `snapshot()`, `stop()`, `delete()`.
+
+### Provisioning lifecycle
+
+`new Sandbox(...)` only stores configuration — it does **not** create or attach to a real sandbox. Call `findOrProvision()` once when you're ready to start using it, and every subsequent operation (`run`, `gitClone`, `uploadAndRun`, agent runs, …) reuses that sandbox:
+
+```ts
+const sandbox = new Sandbox("modal", {
+  /* … */
+});
+
+await sandbox.findOrProvision(); // attach to existing tagged sandbox or create a fresh one
+await sandbox.gitClone({ repoUrl: "…" });
+const result = await sandbox.run("pnpm install");
+```
+
+Calling a method that needs a live sandbox before `findOrProvision()` throws a clear error. This makes the (potentially slow) attach / create step explicit and lets you control exactly when it happens.
+
+Vercel sandboxes use runtime snapshots instead of pre-built images — call `sandbox.snapshot()` to capture state and pass the returned id via `provider.snapshotId` on the next run.
+
+Vercel also requires ports to be declared at create time via `provider.ports` — `openPort()` is a no-op at runtime, so any port the agent (or your own code) will listen on must be listed up front:
+
+```ts
+const sandbox = new Sandbox("vercel", {
+  provider: {
+    snapshotId: process.env.VERCEL_SNAPSHOT_ID!,
+    ports: [4096], // e.g. opencode; codex/claude-code use 43180
+  },
+});
+```
+
+## Skills
+
+Attach GitHub repos as agent skills. They're cloned into the sandbox and surfaced to the agent:
+
+```ts
+const agent = new Agent("claude-code", {
+  sandbox,
+  cwd: "/workspace",
+  approvalMode: "auto",
+  skills: [
+    {
+      name: "agent-browser",
+      repo: "https://github.com/vercel-labs/agent-browser",
+    },
+  ],
+});
+```
+
+You can also embed skills inline:
+
+```ts
+skills: [
+  {
+    source: "embedded",
+    name: "lint-fix",
+    files: {
+      "SKILL.md": "Run `npm run lint:fix` and verify the output is clean.",
+    },
+  },
+],
+```
+
+## Sub-agents
+
+Delegate tasks to specialized sub-agents:
+
+```ts
+const agent = new Agent("claude-code", {
+  sandbox,
+  cwd: "/workspace",
+  approvalMode: "auto",
+  subAgents: [
+    {
+      name: "reviewer",
+      description: "Reviews code for
